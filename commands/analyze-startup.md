@@ -51,7 +51,7 @@ bash "<脚本路径>" "$TP" "<trace文件>" [包名]
 
 ## 第三步：SQL 查询
 
-查询 1-11、14 由辅助脚本自动执行，查询 12-13 根据 Binder 分析结果按需手动执行，查询 15 根据调度优先级分析结果按需手动执行，查询 16 根据主线程阻塞时间按需手动执行。所有查询使用 Perfetto SQL stdlib（自动可用）。需要 startup_id 的查询使用查询 1 中发现的值。需要包名过滤的查询使用用户参数或查询 1 中发现的包名。
+查询 1-11、14、16 由辅助脚本自动执行，查询 12-13 根据 Binder 分析结果按需手动执行，查询 15 根据调度优先级分析结果按需手动执行。所有查询使用 Perfetto SQL stdlib（自动可用）。需要 startup_id 的查询使用查询 1 中发现的值。需要包名过滤的查询使用用户参数或查询 1 中发现的包名。
 
 ### 查询 1：启动概览
 
@@ -433,52 +433,82 @@ WHERE s.startup_id = <STARTUP_ID>
 ORDER BY sc.ts;
 ```
 
-### 查询 16：主线程唤醒链优先级反转分析（按需手动执行）
+### 查询 16：主线程唤醒链优先级反转分析（由辅助脚本自动执行）
 
 通过 `sched_waking` 内核事件追踪"谁唤醒了主线程"。当主线程处于 Sleep（S）或不可中断等待（D）时，唤醒它的线程就是主线程的依赖。如果唤醒者是 CFS 而主线程是 RT，则构成优先级反转。
 
-**前置条件**: 需要先确认 trace 中有 sched_waking 数据:
+**前置条件**: 需要先确认 trace 中有 sched_waking 数据（辅助脚本会自动检查）。
+
+查询 16 使用 `CREATE PERFETTO TABLE` 分步物化执行，避免以下性能陷阱:
+- `ftrace_event` + `args` 的 `EXISTS` 逐行相关子查询（原方案在 491K 行 sched_waking 上超时）
+- `NOT EXISTS` 反连接 O(W^2) 复杂度
+- CTE 不物化导致重复求值
+
+**步骤 0: 物化 startup 参数**
 
 ```sql
-SELECT name, COUNT(*) AS cnt FROM ftrace_event WHERE name LIKE '%sched_wak%' GROUP BY name;
+INCLUDE PERFETTO MODULE android.startup.startups;
+CREATE PERFETTO TABLE _q16_startup AS
+SELECT s.ts AS start_ts, s.ts + s.dur AS end_ts,
+       t.utid AS main_utid, t.tid AS main_tid
+FROM android_startups s
+JOIN process p ON p.name = s.package
+JOIN thread t ON t.upid = p.upid AND t.is_main_thread = 1
+WHERE s.startup_id = <STARTUP_ID>;
 ```
 
-如果无 `sched_waking` 事件，跳过本查询。
+**步骤 1: 物化主线程 S/D 阻塞段**
+
+```sql
+CREATE PERFETTO TABLE _q16_blocked AS
+SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts,
+       ts.dur / 1e6 AS blocked_ms, ts.state, ts.io_wait, ts.blocked_function
+FROM thread_state ts, _q16_startup su
+WHERE ts.utid = su.main_utid
+  AND ts.ts >= su.start_ts AND ts.ts + ts.dur <= su.end_ts
+  AND ts.state IN ('S', 'D') AND ts.dur > 100000;
+```
+
+**步骤 2: 物化唤醒事件（关键优化: JOIN 替代 EXISTS）**
+
+```sql
+CREATE PERFETTO TABLE _q16_waking AS
+SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
+FROM ftrace_event fe
+JOIN args a ON a.arg_set_id = fe.arg_set_id AND a.key = 'pid'
+JOIN _q16_startup su ON a.int_value = su.main_tid
+WHERE fe.name = 'sched_waking'
+  AND fe.ts >= su.start_ts AND fe.ts <= su.end_ts;
+```
+
+**步骤 3: 匹配阻塞段与唤醒者（ROW_NUMBER 替代 NOT EXISTS）**
+
+```sql
+CREATE PERFETTO TABLE _q16_matched AS
+SELECT * FROM (
+  SELECT mb.block_start, mb.wake_ts, mb.blocked_ms,
+         mb.state, mb.io_wait, mb.blocked_function,
+         we.waker_utid, we.wake_event_ts,
+         ROW_NUMBER() OVER (PARTITION BY mb.block_start ORDER BY we.wake_event_ts DESC) AS rn
+  FROM _q16_blocked mb
+  LEFT JOIN _q16_waking we
+    ON we.wake_event_ts <= mb.wake_ts AND we.wake_event_ts > mb.wake_ts - 1000000
+) WHERE rn = 1 OR waker_utid IS NULL;
+```
+
+**步骤 4: 获取唤醒者优先级**
+
+```sql
+CREATE PERFETTO TABLE _q16_result AS
+SELECT m.*,
+  (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = m.waker_utid
+     AND sc.ts <= m.wake_event_ts AND sc.ts + sc.dur > m.wake_event_ts LIMIT 1) AS waker_priority
+FROM _q16_matched m;
+```
 
 **查询 16a: 唤醒者优先级分类汇总**
 
 ```sql
-INCLUDE PERFETTO MODULE android.startup.startups;
-
-WITH main_blocked AS (
-  SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts, ts.dur / 1e6 AS blocked_ms,
-    ts.state, ts.io_wait, ts.blocked_function
-  FROM thread_state ts
-  JOIN android_startups s ON s.startup_id = <STARTUP_ID>
-  JOIN process p ON p.name = s.package
-  JOIN thread t ON t.upid = p.upid AND t.is_main_thread = 1
-  WHERE ts.utid = t.utid AND ts.ts >= s.ts AND ts.ts + ts.dur <= s.ts + s.dur
-    AND ts.state IN ('S', 'D') AND ts.dur > 100000
-),
-waking_events AS (
-  SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
-  FROM ftrace_event fe
-  JOIN android_startups s ON s.startup_id = <STARTUP_ID>
-  JOIN process p ON p.name = s.package
-  JOIN thread t ON t.upid = p.upid AND t.is_main_thread = 1
-  WHERE fe.name = 'sched_waking' AND fe.ts >= s.ts AND fe.ts <= s.ts + s.dur
-    AND EXISTS (SELECT 1 FROM args a WHERE a.arg_set_id = fe.arg_set_id AND a.key = 'pid' AND a.int_value = t.tid)
-),
-matched AS (
-  SELECT mb.*, we.waker_utid,
-    (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = we.waker_utid
-       AND sc.ts <= we.wake_event_ts AND sc.ts + sc.dur > we.wake_event_ts LIMIT 1) AS waker_priority
-  FROM main_blocked mb
-  LEFT JOIN waking_events we ON we.wake_event_ts <= mb.wake_ts
-    AND we.wake_event_ts > mb.wake_ts - 1000000
-    AND NOT EXISTS (SELECT 1 FROM waking_events we2 WHERE we2.wake_event_ts > we.wake_event_ts
-      AND we2.wake_event_ts <= mb.wake_ts AND we2.wake_event_ts > mb.wake_ts - 1000000)
-)
 SELECT
   CASE
     WHEN waker_priority IS NULL THEN 'unknown'
@@ -487,18 +517,16 @@ SELECT
   END AS waker_class,
   COUNT(*) AS wakeup_count,
   SUM(blocked_ms) AS total_blocked_ms,
-  ROUND(SUM(blocked_ms) * 100.0 / (SELECT SUM(blocked_ms) FROM matched), 1) AS pct
-FROM matched GROUP BY waker_class ORDER BY total_blocked_ms DESC;
+  ROUND(SUM(blocked_ms) * 100.0 / (SELECT SUM(blocked_ms) FROM _q16_result), 1) AS pct
+FROM _q16_result GROUP BY waker_class ORDER BY total_blocked_ms DESC;
 ```
 
 **查询 16b: CFS 唤醒者详细列表（优先级反转源）**
 
-使用与 16a 相同的 CTE 结构，最后 SELECT:
-
 ```sql
 SELECT wt.name AS waker_thread, wp.name AS waker_process, m.waker_priority,
   COUNT(*) AS times, SUM(m.blocked_ms) AS total_blocked_ms, MAX(m.blocked_ms) AS max_blocked_ms
-FROM matched m
+FROM _q16_result m
 LEFT JOIN thread wt ON wt.utid = m.waker_utid
 LEFT JOIN process wp ON wp.upid = wt.upid
 WHERE m.waker_priority >= 100
@@ -508,13 +536,11 @@ ORDER BY total_blocked_ms DESC LIMIT 30;
 
 **查询 16c: 唤醒者详细列表（含阻塞函数和状态）**
 
-使用与 16a 相同的 CTE 结构，最后 SELECT:
-
 ```sql
 SELECT m.state, m.io_wait, m.blocked_ms, m.blocked_function,
   wt.name AS waker_thread, wp.name AS waker_process, m.waker_priority,
   CASE WHEN m.waker_priority < 100 THEN 'RT' WHEN m.waker_priority IS NULL THEN 'unknown' ELSE 'CFS' END AS waker_class
-FROM matched m
+FROM _q16_result m
 LEFT JOIN thread wt ON wt.utid = m.waker_utid
 LEFT JOIN process wp ON wp.upid = wt.upid
 ORDER BY m.blocked_ms DESC LIMIT 40;
@@ -525,18 +551,25 @@ ORDER BY m.blocked_ms DESC LIMIT 40;
 对 16b 中主要的 CFS 唤醒者线程，查看其在启动期间的线程状态分布，特别关注 Runnable 时间（等 CPU）:
 
 ```sql
-INCLUDE PERFETTO MODULE android.startup.startups;
-
 SELECT ts.state, ts.io_wait,
-  SUM(MIN(ts.ts + ts.dur, s.ts + s.dur) - MAX(ts.ts, s.ts)) / 1e6 AS total_ms
-FROM android_startups s
+  SUM(MIN(ts.ts + ts.dur, su.end_ts) - MAX(ts.ts, su.start_ts)) / 1e6 AS total_ms
+FROM _q16_startup su
 JOIN thread_state ts ON ts.utid = <WAKER_UTID>
-WHERE s.startup_id = <STARTUP_ID>
-  AND ts.ts < s.ts + s.dur AND ts.ts + ts.dur > s.ts
+WHERE ts.ts < su.end_ts AND ts.ts + ts.dur > su.start_ts
 GROUP BY ts.state, ts.io_wait ORDER BY total_ms DESC;
 ```
 
-**手动执行方式**: 查询 16 的 CTE 较复杂，建议拆分执行。先用简单查询确认 sched_waking 存在，再用完整 CTE 获取结果。如果 CTE 执行失败，可逐步简化——先获取主线程所有 S/D 段的时间窗口，再对每段分别查找最近的 sched_waking 事件。
+**清理临时表**（所有 16 系列查询完成后执行）:
+
+```sql
+DROP TABLE IF EXISTS _q16_startup;
+DROP TABLE IF EXISTS _q16_blocked;
+DROP TABLE IF EXISTS _q16_waking;
+DROP TABLE IF EXISTS _q16_matched;
+DROP TABLE IF EXISTS _q16_result;
+```
+
+**手动执行方式**: 查询 16 必须按步骤 0→1→2→3→4 的顺序执行（每步单独一次 trace_processor_shell 调用**不行**，因为 `CREATE PERFETTO TABLE` 是会话内的）。正确做法是将步骤 0-4 + 16a/16b/16c 合并到**同一个 SQL 文件**中，一次性传给 trace_processor_shell。辅助脚本已自动处理。
 
 ## 第三步半A：调度优先级深度分析（条件触发）
 

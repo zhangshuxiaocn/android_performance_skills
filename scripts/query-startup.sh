@@ -349,6 +349,121 @@ echo "========================================"
 "$TP" --run-metrics android_startup --metrics-output=json "$TRACE" 2>/dev/null || echo "(指标查询失败)"
 echo ""
 
+# --- 查询 16: 主线程唤醒链优先级反转分析 ---
+# 使用 CREATE PERFETTO TABLE 分步物化，避免 ftrace_event EXISTS 子查询超时
+# 性能优化: JOIN 替代 EXISTS、ROW_NUMBER 替代 NOT EXISTS、物化避免重复求值
 echo "========================================"
-echo "=== 全部查询完成（共 15 个查询）"
+echo "=== 唤醒链优先级反转分析（查询 16）"
+echo "========================================"
+
+# 先检查是否有 sched_waking 事件
+HAS_SCHED_WAKING=$("$TP" -q /dev/stdin "$TRACE" 2>/dev/null <<SQL | grep -c 'sched_waking' || true
+SELECT name FROM ftrace_event WHERE name = 'sched_waking' LIMIT 1;
+SQL
+)
+
+if [[ "$HAS_SCHED_WAKING" -gt 0 ]]; then
+  # trace_processor_shell -q 模式只允许最后一条语句返回结果
+  # 因此将 16a/16b/16c 拆为三次调用，共享相同的物化步骤前缀
+
+  Q16_PREAMBLE="
+INCLUDE PERFETTO MODULE android.startup.startups;
+
+CREATE PERFETTO TABLE _q16_startup AS
+SELECT s.ts AS start_ts, s.ts + s.dur AS end_ts,
+       t.utid AS main_utid, t.tid AS main_tid
+FROM android_startups s
+JOIN process p ON p.name = s.package
+JOIN thread t ON t.upid = p.upid AND t.is_main_thread = 1
+WHERE s.startup_id = $STARTUP_ID;
+
+CREATE PERFETTO TABLE _q16_blocked AS
+SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts,
+       ts.dur / 1e6 AS blocked_ms, ts.state, ts.io_wait, ts.blocked_function
+FROM thread_state ts, _q16_startup su
+WHERE ts.utid = su.main_utid
+  AND ts.ts >= su.start_ts AND ts.ts + ts.dur <= su.end_ts
+  AND ts.state IN ('S', 'D') AND ts.dur > 100000;
+
+CREATE PERFETTO TABLE _q16_waking AS
+SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
+FROM ftrace_event fe
+JOIN args a ON a.arg_set_id = fe.arg_set_id AND a.key = 'pid'
+JOIN _q16_startup su ON a.int_value = su.main_tid
+WHERE fe.name = 'sched_waking'
+  AND fe.ts >= su.start_ts AND fe.ts <= su.end_ts;
+
+CREATE PERFETTO TABLE _q16_matched AS
+SELECT * FROM (
+  SELECT mb.block_start, mb.wake_ts, mb.blocked_ms,
+         mb.state, mb.io_wait, mb.blocked_function,
+         we.waker_utid, we.wake_event_ts,
+         ROW_NUMBER() OVER (PARTITION BY mb.block_start ORDER BY we.wake_event_ts DESC) AS rn
+  FROM _q16_blocked mb
+  LEFT JOIN _q16_waking we
+    ON we.wake_event_ts <= mb.wake_ts AND we.wake_event_ts > mb.wake_ts - 1000000
+) WHERE rn = 1 OR waker_utid IS NULL;
+
+CREATE PERFETTO TABLE _q16_result AS
+SELECT m.*,
+  (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = m.waker_utid
+     AND sc.ts <= m.wake_event_ts AND sc.ts + sc.dur > m.wake_event_ts LIMIT 1) AS waker_priority
+FROM _q16_matched m;
+"
+
+  # 16a
+  echo "--- 16a: 唤醒者优先级分类汇总 ---"
+  cat > /tmp/_q16.sql <<SQLEOF
+$Q16_PREAMBLE
+SELECT
+  CASE
+    WHEN waker_priority IS NULL THEN 'unknown'
+    WHEN waker_priority < 100 THEN 'RT (<100)'
+    ELSE 'CFS (>=' || waker_priority || ')'
+  END AS waker_class,
+  COUNT(*) AS wakeup_count,
+  SUM(blocked_ms) AS total_blocked_ms,
+  ROUND(SUM(blocked_ms) * 100.0 / (SELECT SUM(blocked_ms) FROM _q16_result), 1) AS pct
+FROM _q16_result GROUP BY waker_class ORDER BY total_blocked_ms DESC;
+SQLEOF
+  "$TP" -q /tmp/_q16.sql "$TRACE" 2>/dev/null || echo "(16a 失败)"
+  echo ""
+
+  # 16b
+  echo "--- 16b: CFS 唤醒者详细列表 ---"
+  cat > /tmp/_q16.sql <<SQLEOF
+$Q16_PREAMBLE
+SELECT wt.name AS waker_thread, wp.name AS waker_process, m.waker_priority,
+  COUNT(*) AS times, SUM(m.blocked_ms) AS total_blocked_ms, MAX(m.blocked_ms) AS max_blocked_ms
+FROM _q16_result m
+LEFT JOIN thread wt ON wt.utid = m.waker_utid
+LEFT JOIN process wp ON wp.upid = wt.upid
+WHERE m.waker_priority >= 100
+GROUP BY wt.name, wp.name, m.waker_priority
+ORDER BY total_blocked_ms DESC LIMIT 30;
+SQLEOF
+  "$TP" -q /tmp/_q16.sql "$TRACE" 2>/dev/null || echo "(16b 失败)"
+  echo ""
+
+  # 16c
+  echo "--- 16c: 唤醒者详细列表（含阻塞函数和状态）---"
+  cat > /tmp/_q16.sql <<SQLEOF
+$Q16_PREAMBLE
+SELECT m.state, m.io_wait, m.blocked_ms, m.blocked_function,
+  wt.name AS waker_thread, wp.name AS waker_process, m.waker_priority,
+  CASE WHEN m.waker_priority < 100 THEN 'RT' WHEN m.waker_priority IS NULL THEN 'unknown' ELSE 'CFS' END AS waker_class
+FROM _q16_result m
+LEFT JOIN thread wt ON wt.utid = m.waker_utid
+LEFT JOIN process wp ON wp.upid = wt.upid
+ORDER BY m.blocked_ms DESC LIMIT 40;
+SQLEOF
+  "$TP" -q /tmp/_q16.sql "$TRACE" 2>/dev/null || echo "(16c 失败)"
+  rm -f /tmp/_q16.sql
+else
+  echo "(trace 未采集 sched_waking 事件，跳过唤醒链分析)"
+fi
+echo ""
+
+echo "========================================"
+echo "=== 全部查询完成"
 echo "========================================"
