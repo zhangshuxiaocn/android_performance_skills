@@ -1021,6 +1021,7 @@ ORDER BY preemptor_total_ms DESC LIMIT 15;
 - 展示因果箭头（`─→`），说明上游原因如何导致下游影响
 - 涵盖所有查询发现的主要问题，不遗漏
 - 区分**应用自身可控**的原因和**系统环境**原因
+- **层级关系必须基于 trace 中 slice 的实际父子关系（depth/parent_id），不能凭语义猜测**。例如 `makeApplication` 和 `app.onCreate` 在 trace 中都是 `bindApplication` 的直接子 slice，它们之间是并列关系而非包含关系，在链路图中应作为同级分支展示
 - 对锁竞争和长阻塞事件，展开锁持有者的内部执行分解（Running/Sleep/D-IO 占比）
 - 如果持有者又被其他线程阻塞，继续递归展开（最多 10 层），直到找到 CPU 工作、I/O 操作或内核等待等终端原因
 - 递归链路中标注每层的线程名、优先级、状态占比
