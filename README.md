@@ -20,19 +20,38 @@ cd android_performance_skills
 bash install.sh
 ```
 
-`install.sh` 会将仓库软链接到 `~/.claude/plugins/local/android-performance-skills`，并清理旧的 `analyze-startup` 链接。
+`install.sh` 会做两件事：
+
+1. 将仓库软链接到 `~/.claude/plugins/local/analyze-startup`（辅助脚本查找路径）
+2. 将 `commands/*.md` 软链接到 `~/.claude/commands/`（Claude Code 命令注册）
+
+安装完成后，**重启 Claude Code** 使命令生效。
 
 ### 手动安装
 
 ```bash
 git clone https://github.com/zhangshuxiaocn/android_performance_skills.git ~/android_performance_skills
 
-# 创建软链接
+# 1. 注册自定义命令（必须，否则 /命令名 不可用）
+mkdir -p ~/.claude/commands
+ln -s ~/android_performance_skills/commands/analyze-startup.md ~/.claude/commands/analyze-startup.md
+
+# 2. 插件目录链接（辅助脚本依赖此路径）
 mkdir -p ~/.claude/plugins/local
-ln -s ~/android_performance_skills ~/.claude/plugins/local/android-performance-skills
+ln -s ~/android_performance_skills ~/.claude/plugins/local/analyze-startup
 ```
 
-安装完成后，**重启 Claude Code** 使插件生效。
+安装完成后，**重启 Claude Code** 使命令生效。
+
+### 工作原理
+
+Claude Code 加载自定义斜杠命令（`/命令名`）的机制：
+
+- **`~/.claude/commands/`** — 全局自定义命令目录。Claude Code 启动时扫描此目录下的 `.md` 文件，每个文件注册为一个 `/命令名`。这是命令能被识别的**必要条件**。
+- **`.claude/commands/`**（项目根目录下）— 项目级自定义命令，仅在该项目中可用。
+- **`~/.claude/plugins/local/`** — 本地插件目录。目前 Claude Code 不会自动从此目录发现命令，但 skill 的辅助脚本（如 `query-startup.sh`）会通过此路径查找。
+
+因此本仓库的 `commands/` 目录需要通过软链接"注册"到 `~/.claude/commands/`，而仓库本身链接到 `plugins/local/` 供脚本定位。`install.sh` 自动完成这两步。
 
 ## Skills 详解
 
@@ -91,6 +110,8 @@ bash scripts/query-startup.sh /path/to/trace_processor_shell /path/to/trace.perf
 4. 提交 PR
 
 Skill 文件格式参考 `commands/analyze-startup.md`，需包含 frontmatter（description、allowed-tools 等）和完整的分析指令。
+
+> **注意**: 添加新 skill 后，用户需重新运行 `bash install.sh` 将新的 `.md` 文件链接到 `~/.claude/commands/`。
 
 ## 前置条件
 
