@@ -2,14 +2,12 @@
 # install.sh — 将本仓库安装为 Claude Code 本地插件
 #
 # 操作:
-#   1. 将仓库目录软链接到 ~/.claude/plugins/local/android-performance-skills
-#   2. 清理旧的 ~/.claude/plugins/local/analyze-startup 链接（如果指向旧仓库）
+#   将仓库目录软链接到 ~/.claude/plugins/local/analyze-startup
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_DIR="$HOME/.claude/plugins/local/android-performance-skills"
-OLD_PLUGIN_DIR="$HOME/.claude/plugins/local/analyze-startup"
+PLUGIN_DIR="$HOME/.claude/plugins/local/analyze-startup"
 
 echo "==> 安装 android-performance-skills 插件"
 echo "    仓库路径: $REPO_DIR"
@@ -39,13 +37,6 @@ else
   echo "    已创建软链接: $PLUGIN_DIR -> $REPO_DIR"
 fi
 
-# 3. 清理旧的 analyze-startup 插件链接
-if [[ -L "$OLD_PLUGIN_DIR" ]]; then
-  echo ""
-  echo "    清理旧链接: $OLD_PLUGIN_DIR"
-  rm "$OLD_PLUGIN_DIR"
-  echo "    已删除。"
-fi
 
 echo ""
 echo "==> 安装完成！"

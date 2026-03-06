@@ -33,9 +33,9 @@ model: opus
 
 **优先方式**: 查找并运行辅助脚本一次性执行所有查询。按以下优先级查找 `query-startup.sh`:
 
-1. `~/.claude/plugins/local/android-performance-skills/scripts/query-startup.sh`
+1. `~/.claude/plugins/local/analyze-startup/scripts/query-startup.sh`
 2. `~/.claude/plugins/local/*/scripts/query-startup.sh`（匹配任意插件名）
-3. `~/.claude/plugins/marketplaces/*/plugins/android-performance-skills/scripts/query-startup.sh`
+3. `~/.claude/plugins/marketplaces/*/plugins/analyze-startup/scripts/query-startup.sh`
 
 找到脚本后执行:
 
