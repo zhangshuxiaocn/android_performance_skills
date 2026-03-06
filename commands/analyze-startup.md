@@ -51,7 +51,7 @@ bash "<脚本路径>" "$TP" "<trace文件>" [包名]
 
 ## 第三步：SQL 查询
 
-查询 1-11、14、16 由辅助脚本自动执行，查询 12-13 根据 Binder 分析结果按需手动执行，查询 15 根据调度优先级分析结果按需手动执行。所有查询使用 Perfetto SQL stdlib（自动可用）。需要 startup_id 的查询使用查询 1 中发现的值。需要包名过滤的查询使用用户参数或查询 1 中发现的包名。
+查询 1-11、14、16 由辅助脚本自动执行，查询 12-13 根据 Binder 分析结果按需手动执行，查询 15 根据调度优先级分析结果按需手动执行，递归依赖链追踪根据锁竞争和唤醒链分析结果按需手动执行。所有查询使用 Perfetto SQL stdlib（自动可用）。需要 startup_id 的查询使用查询 1 中发现的值。需要包名过滤的查询使用用户参数或查询 1 中发现的包名。
 
 ### 查询 1：启动概览
 
@@ -695,6 +695,128 @@ SQL
 | futex / pthread_mutex | 主线程等 native 锁 | 有（futex PI，需 PTHREAD_PRIO_INHERIT） |
 | IO 完成 | 主线程等 IO completion → 由 kworker/softirq 唤醒 | 无 |
 
+## 第三步半D：递归依赖链追踪（条件触发）
+
+当主线程被某个线程阻塞时（锁等待、Sleep 唤醒依赖等），自动追踪"那个阻塞者线程在干什么、被谁阻塞"，递归展开直到找到根因（CPU 工作、I/O、或达到最大深度）。
+
+**触发条件** — 满足以下**任一**条件时执行:
+- 查询 3（主线程耗时 Slice）或查询 5（锁竞争）中存在主线程 `monitor contention` / `Lock contention` 事件 >50ms
+- 查询 16c 中单个 CFS 唤醒者阻塞主线程 >30ms
+
+**分析流程** — 对每个触发事件，执行以下递归步骤（最多 10 层）:
+
+### Step 1: 确定阻塞者线程和时间窗口
+
+- 从锁竞争 slice 的 `owner tid` 提取阻塞者线程 tid
+- 或从查询 16c 的唤醒者 utid 提取
+- 时间窗口 = 主线程被阻塞的起止时间
+
+### Step 2: 查询阻塞者线程在该时间窗口内的状态分布
+
+```sql
+SELECT ts.state, ts.io_wait, ts.blocked_function,
+  SUM(MIN(ts.ts + ts.dur, <END_TS>) - MAX(ts.ts, <START_TS>)) / 1e6 AS total_ms
+FROM thread_state ts
+WHERE ts.utid = <BLOCKER_UTID>
+  AND ts.ts + ts.dur > <START_TS> AND ts.ts < <END_TS>
+GROUP BY ts.state, ts.io_wait, ts.blocked_function
+ORDER BY total_ms DESC;
+```
+
+### Step 3: 查询阻塞者线程在该时间窗口内的 slice 执行内容
+
+```sql
+SELECT s.id, s.name, s.dur / 1e6 AS dur_ms, s.depth
+FROM slice s
+JOIN thread_track tt ON tt.id = s.track_id
+WHERE tt.utid = <BLOCKER_UTID>
+  AND s.ts + s.dur > <START_TS> AND s.ts < <END_TS>
+  AND s.dur > 500000
+ORDER BY s.dur DESC LIMIT 20;
+```
+
+### Step 4: 如果阻塞者线程有显著的非 Running 时间，查询谁阻塞/唤醒了它
+
+当阻塞者线程的 S/D 状态 >30% 或 R/R+ >20% 时，继续追踪。
+
+**对 Sleep/D 状态** — 通过 sched_waking 追踪唤醒者（使用 CREATE PERFETTO TABLE 物化，类似查询 16 的模式）:
+
+```sql
+-- 物化阻塞段
+CREATE PERFETTO TABLE _chain_blocked AS
+SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts, ts.dur / 1e6 AS blocked_ms,
+       ts.state, ts.io_wait, ts.blocked_function
+FROM thread_state ts
+WHERE ts.utid = <BLOCKER_UTID>
+  AND ts.ts >= <START_TS> AND ts.ts + ts.dur <= <END_TS>
+  AND ts.state IN ('S', 'D') AND ts.dur > 100000;
+
+-- 物化唤醒事件
+CREATE PERFETTO TABLE _chain_waking AS
+SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
+FROM ftrace_event fe
+JOIN args a ON a.arg_set_id = fe.arg_set_id AND a.key = 'pid'
+WHERE fe.name = 'sched_waking'
+  AND a.int_value = <BLOCKER_TID>
+  AND fe.ts >= <START_TS> AND fe.ts <= <END_TS>;
+
+-- 匹配阻塞段与唤醒者
+CREATE PERFETTO TABLE _chain_matched AS
+SELECT * FROM (
+  SELECT mb.block_start, mb.wake_ts, mb.blocked_ms,
+         mb.state, mb.io_wait, mb.blocked_function,
+         we.waker_utid, we.wake_event_ts,
+         ROW_NUMBER() OVER (PARTITION BY mb.block_start ORDER BY we.wake_event_ts DESC) AS rn
+  FROM _chain_blocked mb
+  LEFT JOIN _chain_waking we
+    ON we.wake_event_ts <= mb.wake_ts AND we.wake_event_ts > mb.wake_ts - 1000000
+) WHERE rn = 1 OR waker_utid IS NULL;
+
+-- 获取唤醒者信息和优先级
+SELECT m.blocked_ms, m.state, m.blocked_function,
+  t.name AS waker_thread, p.name AS waker_process,
+  (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = m.waker_utid
+     AND sc.ts <= m.wake_event_ts AND sc.ts + sc.dur > m.wake_event_ts LIMIT 1) AS waker_priority
+FROM _chain_matched m
+LEFT JOIN thread t ON t.utid = m.waker_utid
+LEFT JOIN process p ON p.upid = t.upid
+WHERE m.rn = 1 OR m.waker_utid IS NULL
+ORDER BY m.blocked_ms DESC LIMIT 20;
+
+-- 清理
+DROP TABLE IF EXISTS _chain_blocked;
+DROP TABLE IF EXISTS _chain_waking;
+DROP TABLE IF EXISTS _chain_matched;
+```
+
+**对 R+/R 状态** — 查询谁抢占了它:
+
+```sql
+SELECT p2.name AS preemptor_process, t2.name AS preemptor_thread,
+  sc2.priority AS preemptor_prio, COUNT(*) AS count,
+  SUM(sc2.dur) / 1e6 AS preemptor_total_ms
+FROM sched_slice sc
+JOIN sched_slice sc2 ON sc2.cpu = sc.cpu AND sc2.ts = sc.ts + sc.dur
+JOIN thread t2 ON t2.utid = sc2.utid
+LEFT JOIN process p2 ON p2.upid = t2.upid
+WHERE sc.utid = <BLOCKER_UTID> AND sc.end_state = 'R+'
+  AND sc.ts >= <START_TS> AND sc.ts + sc.dur <= <END_TS>
+GROUP BY p2.name, t2.name, sc2.priority
+ORDER BY preemptor_total_ms DESC LIMIT 15;
+```
+
+### Step 5: 递归
+
+如果发现新的阻塞者（唤醒者线程阻塞时间 >20ms），以该线程为新目标，重复 Step 2-4。
+
+**递归终止条件**:
+- 达到最大深度（10 层）
+- 阻塞者主要是 Running 状态（>70%，已找到 CPU 根因）
+- 阻塞者主要是 D-IO（已找到 I/O 根因）
+- 新的阻塞时间 <20ms（不值得继续追踪）
+
+**执行方式**: 每个 Step 都是独立的 `trace_processor_shell` 调用（heredoc 模式）。对同一层的多个查询可以并行执行。使用 CREATE PERFETTO TABLE 时需要合并到同一个 SQL 文件（类似查询 16 的处理方式）。
+
 ## 第四步：分析并生成报告
 
 收集全部查询结果后，请用**中文**输出以下格式的结构化报告:
@@ -865,44 +987,17 @@ SQL
 
 **注意**: 如果 trace 未采集 `sched_waking` 事件，注明无法分析并跳过本节。如果 CFS 唤醒占比 <10%，简要说明"依赖链优先级正常，无显著反转"即可。
 
-#### 8. 优化建议
-
-根据数据给出**具体可操作**的优化建议。常见建议:
-
-| 现象 | 建议 |
-|------|------|
-| bindApplication >1250ms | 延迟 ContentProvider/第三方库初始化；使用 App Startup 库 |
-| 布局 inflate >450ms | 简化布局层级；使用 ViewStub / 延迟加载 |
-| VerifyClass >15% | 生成并分发 baseline profile |
-| 锁竞争 >20% | 减少 synchronized 代码块；使用并发数据结构 |
-| 启动期间发生 GC | 减少对象分配；避免在 onCreate 中创建大对象 |
-| Binder 事务总计 >100ms | 批量化或延迟 IPC 调用；预取数据 |
-| I/O 等待 >450ms | 使用异步 I/O；后台预加载资源 |
-| JIT 编译 >100ms | 分发 baseline profile 或 AOT 编译关键路径 |
-| Runnable >15% | 减少启动期间的线程数量；设置线程优先级 |
-| 资源加载 >130ms | 降低 APK 资源复杂度；启用资源压缩 |
-| 特定 AIDL 接口耗时高 | 缓存查询结果；延迟非关键 IPC 到首帧之后；使用批量 API |
-| 服务端 IO Wait 占比高 | 服务端磁盘操作阻塞 Binder 响应，考虑绕过调用或预热缓存 |
-| 多个 Binder 调用来自同一代码位置 | 合并为单次批量调用或使用本地缓存 |
-| 主线程无 RT 优先级（全程 CFS） | 排查 AMS 启动路径中 RT boost 是否被跳过（温启动进程复用路径、自定义 ROM 调度策略）；检查 setProcessGroup/setThreadScheduler 调用 |
-| 主线程被自身后台线程抢占 | 降低后台线程优先级（setThreadPriority）；减少启动期间的并发线程数 |
-| Runnable >15% 且无 RT 优先级 | 系统调度问题放大了 CPU 竞争，RT 优先级可消除大部分 Runnable 等待 |
-| CFS 唤醒占比 >50%（优先级反转） | 主线程依赖链上的 CFS 线程拖慢了 RT 主线程；提升关键依赖线程优先级或消除同步等待 |
-| kswapd0 阻塞主线程（内核级反转） | 减少启动期间大内存分配避免 direct reclaim；系统层面考虑 kswapd RT 提升 |
-| SharedPreferences awaitLoadedLocked | SP 线程是 CFS 120 但主线程同步等待；改用异步加载或 DataStore 避免阻塞 |
-| CFS 唤醒者 Runnable 时间远超 Running | 唤醒者因低优先级无法及时获取 CPU，间接放大了主线程阻塞；提升该线程优先级或减少 CPU 竞争 |
-
-#### 9. 问题总结与根因分析
+#### 8. 问题总结与根因分析
 
 本节对全部发现进行综合归因，给出完整的根因链路。这是报告中最重要的部分，需要将分散的数据点串联成因果链。
 
-##### 9.1 核心结论
+##### 8.1 核心结论
 
 用 1-2 句话概括启动表现和根本原因。格式:
 
 > **[包名] [启动类型]耗时 XXXms，属于[评定]级别（阈值 XXXms）。根因是……**
 
-##### 9.2 根因链路图
+##### 8.2 根因链路图
 
 用缩进文本树展示因果关系链，从系统级原因到应用级原因，层层展开。格式示例:
 
@@ -926,8 +1021,11 @@ SQL
 - 展示因果箭头（`─→`），说明上游原因如何导致下游影响
 - 涵盖所有查询发现的主要问题，不遗漏
 - 区分**应用自身可控**的原因和**系统环境**原因
+- 对锁竞争和长阻塞事件，展开锁持有者的内部执行分解（Running/Sleep/D-IO 占比）
+- 如果持有者又被其他线程阻塞，继续递归展开（最多 10 层），直到找到 CPU 工作、I/O 操作或内核等待等终端原因
+- 递归链路中标注每层的线程名、优先级、状态占比
 
-##### 9.3 核心问题清单
+##### 8.3 核心问题清单
 
 用表格列出 3-6 个核心问题，每个问题包含直接影响和根因:
 
@@ -940,7 +1038,7 @@ SQL
 - "直接影响"列引用具体数字（如 "bindApplication 974ms，占 54.5%"）
 - "根因"列解释**为什么**会出现这个问题（如 "安全 SDK、WeexJS 等在 onCreate 中同步初始化"）
 
-##### 9.4 一句话总结
+##### 8.4 一句话总结
 
 用一段话（2-3 句）完整概括启动慢的全貌，涵盖:
 - 最耗时的阶段是什么
