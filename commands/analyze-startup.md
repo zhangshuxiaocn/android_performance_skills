@@ -695,6 +695,25 @@ SQL
 | futex / pthread_mutex | 主线程等 native 锁 | 有（futex PI，需 PTHREAD_PRIO_INHERIT） |
 | IO 完成 | 主线程等 IO completion → 由 kworker/softirq 唤醒 | 无 |
 
+## 第三步半D-0：顶层 Slice 线程状态分解（必须执行）
+
+**始终执行**: 对查询 1 中选定的 startup 的每个主线程顶层 slice（depth=0，dur >1ms），查询其时间窗口内主线程的线程状态分布。此数据用于：
+1. 根因链路图中每个顶层原因的精确状态标注（不得估算）
+2. 5.2.1 核心结论中 CPU Running 按阶段拆分表
+
+```sql
+-- 对每个顶层 slice 执行（替换 <SLICE_TS> 和 <SLICE_END_TS>）
+SELECT ts.state, ts.io_wait,
+  SUM(MIN(ts.ts + ts.dur, <SLICE_END_TS>) - MAX(ts.ts, <SLICE_TS>)) / 1e6 AS total_ms
+FROM thread_state ts
+WHERE ts.utid = <MAIN_UTID>
+  AND ts.ts < <SLICE_END_TS> AND ts.ts + ts.dur > <SLICE_TS>
+GROUP BY ts.state, ts.io_wait
+ORDER BY total_ms DESC;
+```
+
+**执行方式**: 对多个顶层 slice **并行**发起多个 Bash 调用。每个 slice 的 ts/end_ts 来自查询 3 中的 slice_id，用 `SELECT ts, ts + dur FROM slice WHERE id = <SLICE_ID>` 获取。
+
 ## 第三步半D：递归依赖链追踪（条件触发）
 
 对启动过程中发现的各类耗时节点，按**三类状态**分别执行递归分析，最多 5 层，直到所有耗时都有可直接定位的终端根因。
@@ -919,7 +938,7 @@ ORDER BY m.blocked_ms DESC LIMIT 20;
 
 要求:
 - **每个顶层原因必须递归展开到具体的终端原因**（如具体的 I/O 操作、CPU 计算、内核等待、具体的 SDK/API 调用等），不能停留在笼统的中间层级。最深不超过 5 级。终端原因的判定标准：该节点已经是可直接定位的代码/系统行为，无法进一步拆解，或剩余耗时 <5ms 不值得继续展开
-- **每个节点必须标注具体耗时数字，且子节点耗时之和应当约等于父节点耗时**。如果子节点之和远小于父节点，必须补充"未覆盖"项来补齐差额，并且**必须对未覆盖部分查询该时间窗口内主线程的线程状态分布**（Running/Sleep/D-IO/Runnable），按状态分类列出具体耗时（如 `未覆盖 XXms：Running XXms, Sleep XXms, D-IO XXms`），不能笼统标注为"CPU 工作"或"应用代码"。查询方式：用 `thread_state` 表查询主线程在父 slice 时间窗口内、排除所有已列出子 slice 时间窗口后的状态分布。对于线程状态分解（Running/Sleep/D-IO），各状态耗时之和应等于该时间窗口总长
+- **每个节点必须标注具体耗时数字，且子节点耗时之和应当约等于父节点耗时**。如果子节点之和远小于父节点，必须补充"未覆盖"项来补齐差额，并且**必须对未覆盖部分查询该时间窗口内主线程的线程状态分布**（Running/Sleep/D-IO/Runnable），按状态分类列出具体耗时（如 `未覆盖 XXms：Running XXms, Sleep XXms, D-IO XXms`），不能笼统标注为"CPU 工作"或"应用代码"或"Running 为主"。**尤其注意**: 一个 slice 的 dur 远大于其子节点之和时，差额中往往包含大量 Sleep（等待锁、binder、异步回调），不能默认为 Running。必须用第三步半D-0 中已查询的顶层 slice 线程状态数据，或用 `thread_state` 表查询该时间窗口的实际状态分布。对于线程状态分解（Running/Sleep/D-IO），各状态耗时之和应等于该时间窗口总长
 - 展示因果箭头（`─→`），说明上游原因如何导致下游影响
 - 涵盖所有查询发现的主要问题，不遗漏
 - 区分**应用自身可控**的原因和**系统环境**原因
@@ -990,11 +1009,20 @@ ORDER BY m.blocked_ms DESC LIMIT 20;
 
 | 根因类别 | 耗时 (ms) | 占比 | 说明 |
 |----------|-----------|------|------|
-| CPU Running（正常执行） | XXX | XX% | 应用代码执行 + 布局计算等 |
+| CPU Running（正常执行） | XXX | XX% | 按阶段拆分见下表 |
 | I/O 加载（D-IO） | XXX | XX% | 磁盘读取（DEX/SO/APK 文件、资源文件等） |
 | 阻塞等待（Sleep） | XXX | XX% | 等待后台线程/异步操作完成。其中 CFS 依赖 XXms（XX%，优先级反转放大）、RT 依赖 XXms（XX%，正常） |
 | 调度等待（R/R+） | XXX | XX% | 等待 CPU 分配，含被抢占时间 |
 | 内核操作（D non-IO） | XXX | XX% | mmap、mprotect 等内核操作 |
+
+**CPU Running 按阶段拆分**（必须通过查询每个顶层 slice 时间窗口内主线程 `thread_state` 获取精确值，不得估算）:
+
+| 阶段 | Running (ms) | 主要内容 |
+|------|------------|---------|
+| bindApplication | XXX | SDK 初始化、DEX 加载等 |
+| doFrame (各帧) | XXX | 布局 measure/layout 计算 |
+| clientTransactionExecuted | XXX | Activity 生命周期回调 |
+| 其他 | XXX | ActivityThreadMain、帧间间隙等 |
 
 最后用 2-3 句话展开因果关系，涵盖:
 - 最耗时的阶段是什么
@@ -1003,6 +1031,7 @@ ORDER BY m.blocked_ms DESC LIMIT 20;
 
 **说明**: 上述时间分解的数据来源:
 - CPU Running / D-IO / D non-IO / R / R+：直接来自查询 4（主线程状态分布）
+- CPU Running 按阶段拆分：对每个顶层 slice（depth=0）查询其时间窗口内主线程 `thread_state` 中 `state='Running'` 的总时间。查询方式见下方
 - CFS 依赖 vs RT 依赖：来自查询 16a（唤醒者优先级分类汇总），将 Sleep 总时间按 CFS/RT 唤醒占比拆分
 - 各项之和应约等于启动总耗时
 
