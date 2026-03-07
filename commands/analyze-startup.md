@@ -697,99 +697,89 @@ SQL
 
 ## 第三步半D：递归依赖链追踪（条件触发）
 
-当主线程被某个线程阻塞时（锁等待、Sleep 唤醒依赖等），自动追踪"那个阻塞者线程在干什么、被谁阻塞"，递归展开直到找到根因（CPU 工作、I/O、或达到最大深度）。
+对启动过程中发现的各类耗时节点，按**三类状态**分别执行递归分析，最多 5 层，直到所有耗时都有可直接定位的终端根因。
 
-**触发条件** — 满足以下**任一**条件时执行:
-- 查询 3（主线程耗时 Slice）或查询 5（锁竞争）中存在主线程 `monitor contention` / `Lock contention` 事件 >50ms
-- 查询 16c 中单个 CFS 唤醒者阻塞主线程 >30ms
+**三类触发条件**（对每个分析节点，查看其线程状态分布后选择对应分析方式）:
+- **Running >20ms** → 触发频率/内容分析：查询该时间窗口内的 slice 内容，找出高频/大耗时操作
+- **R + R+ >10ms** → 触发调度优先级分析：查询被抢占时（`end_state='R+'`）的接替者列表
+- **Sleep (S) >20ms 或 D >10ms** → 触发阻塞依赖分析：追踪唤醒者（S 用 sched_waking）或内核等待（D 用 blocked_function），以对方为下一层继续递归
 
-**分析流程** — 对每个触发事件，执行以下递归步骤（最多 5 层）:
+**分析流程** — 对每个触发节点，执行以下步骤（最多 5 层）:
 
-### Step 1: 确定阻塞者线程和时间窗口
+### Step 1: 确定分析目标线程和时间窗口
 
-- 从锁竞争 slice 的 `owner tid` 提取阻塞者线程 tid
-- 或从查询 16c 的唤醒者 utid 提取
-- 时间窗口 = 主线程被阻塞的起止时间
+来源（三种方式，对应三类触发）:
+- **阻塞依赖**：从锁竞争 slice 的 `owner tid` 提取持锁线程，时间窗口 = 主线程被阻塞的起止时间
+- **阻塞依赖（Sleep）**：从查询 16c 的唤醒者 utid 提取，时间窗口 = 该唤醒者在主线程被阻塞期间的活跃时段
+- **Running/Runnable 分析**：目标为当前节点线程本身，时间窗口 = 当前节点的 slice 时间范围
 
-### Step 2: 查询阻塞者线程在该时间窗口内的状态分布
+### Step 2: 查询目标线程在该时间窗口内的**完整状态分布**
 
 ```sql
 SELECT ts.state, ts.io_wait, ts.blocked_function,
   SUM(MIN(ts.ts + ts.dur, <END_TS>) - MAX(ts.ts, <START_TS>)) / 1e6 AS total_ms
 FROM thread_state ts
-WHERE ts.utid = <BLOCKER_UTID>
+WHERE ts.utid = <TARGET_UTID>
   AND ts.ts + ts.dur > <START_TS> AND ts.ts < <END_TS>
 GROUP BY ts.state, ts.io_wait, ts.blocked_function
 ORDER BY total_ms DESC;
 ```
 
-### Step 3: 查询阻塞者线程在该时间窗口内的 slice 执行内容
+### Step 3A: 针对 Running 时间长（>20ms）→ 查询 slice 内容 + CPU 频点（频率/内容分析）
+
+**3A-1: 查询 slice 执行内容**（在干什么）
 
 ```sql
-SELECT s.id, s.name, s.dur / 1e6 AS dur_ms, s.depth
+SELECT s.name, COUNT(*) AS cnt,
+  SUM(s.dur) / 1e6 AS total_ms,
+  MAX(s.dur) / 1e6 AS max_ms
 FROM slice s
 JOIN thread_track tt ON tt.id = s.track_id
-WHERE tt.utid = <BLOCKER_UTID>
+WHERE tt.utid = <TARGET_UTID>
   AND s.ts + s.dur > <START_TS> AND s.ts < <END_TS>
   AND s.dur > 500000
-ORDER BY s.dur DESC LIMIT 20;
+GROUP BY s.name
+ORDER BY total_ms DESC LIMIT 20;
 ```
 
-### Step 4: 如果阻塞者线程有显著的非 Running 时间，查询谁阻塞/唤醒了它
+**3A-2: 查询 CPU 分布和工作频点**（在哪个核、跑多快）
 
-当阻塞者线程的 S/D 状态 >30% 或 R/R+ >20% 时，继续追踪。
-
-**对 Sleep/D 状态** — 通过 sched_waking 追踪唤醒者（使用 CREATE PERFETTO TABLE 物化，类似查询 16 的模式）:
+分两步查询（先看 CPU 分布，再查各 CPU 频点）:
 
 ```sql
--- 物化阻塞段
-CREATE PERFETTO TABLE _chain_blocked AS
-SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts, ts.dur / 1e6 AS blocked_ms,
-       ts.state, ts.io_wait, ts.blocked_function
-FROM thread_state ts
-WHERE ts.utid = <BLOCKER_UTID>
-  AND ts.ts >= <START_TS> AND ts.ts + ts.dur <= <END_TS>
-  AND ts.state IN ('S', 'D') AND ts.dur > 100000;
+-- 3A-2a: CPU 分布
+SELECT sc.cpu,
+  COUNT(*) AS slice_count,
+  SUM(MIN(sc.ts + sc.dur, <END_TS>) - MAX(sc.ts, <START_TS>)) / 1e6 AS running_ms
+FROM sched_slice sc
+WHERE sc.utid = <TARGET_UTID>
+  AND sc.ts + sc.dur > <START_TS> AND sc.ts < <END_TS>
+GROUP BY sc.cpu
+ORDER BY running_ms DESC;
 
--- 物化唤醒事件
-CREATE PERFETTO TABLE _chain_waking AS
-SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
-FROM ftrace_event fe
-JOIN args a ON a.arg_set_id = fe.arg_set_id AND a.key = 'pid'
-WHERE fe.name = 'sched_waking'
-  AND a.int_value = <BLOCKER_TID>
-  AND fe.ts >= <START_TS> AND fe.ts <= <END_TS>;
-
--- 匹配阻塞段与唤醒者
-CREATE PERFETTO TABLE _chain_matched AS
-SELECT * FROM (
-  SELECT mb.block_start, mb.wake_ts, mb.blocked_ms,
-         mb.state, mb.io_wait, mb.blocked_function,
-         we.waker_utid, we.wake_event_ts,
-         ROW_NUMBER() OVER (PARTITION BY mb.block_start ORDER BY we.wake_event_ts DESC) AS rn
-  FROM _chain_blocked mb
-  LEFT JOIN _chain_waking we
-    ON we.wake_event_ts <= mb.wake_ts AND we.wake_event_ts > mb.wake_ts - 1000000
-) WHERE rn = 1 OR waker_utid IS NULL;
-
--- 获取唤醒者信息和优先级
-SELECT m.blocked_ms, m.state, m.blocked_function,
-  t.name AS waker_thread, p.name AS waker_process,
-  (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = m.waker_utid
-     AND sc.ts <= m.wake_event_ts AND sc.ts + sc.dur > m.wake_event_ts LIMIT 1) AS waker_priority
-FROM _chain_matched m
-LEFT JOIN thread t ON t.utid = m.waker_utid
-LEFT JOIN process p ON p.upid = t.upid
-WHERE m.rn = 1 OR m.waker_utid IS NULL
-ORDER BY m.blocked_ms DESC LIMIT 20;
-
--- 清理
-DROP TABLE IF EXISTS _chain_blocked;
-DROP TABLE IF EXISTS _chain_waking;
-DROP TABLE IF EXISTS _chain_matched;
+-- 3A-2b: 各 CPU 在该时间段的频率分布（取时间窗口内采样点）
+-- 注意：必须用 cpu_counter_track（有 cpu 列），不能用 counter_track
+SELECT cct.cpu,
+  CAST(c.value / 1000 AS INT) AS freq_mhz,
+  COUNT(*) AS transitions
+FROM counter c
+JOIN cpu_counter_track cct ON cct.id = c.track_id
+WHERE cct.name = 'cpufreq'
+  AND cct.cpu IN (/* 3A-2a 中出现的 cpu 列表 */)
+  AND c.ts >= <START_TS> AND c.ts < <END_TS>
+GROUP BY cct.cpu, CAST(c.value / 1000 AS INT)
+ORDER BY cct.cpu, transitions DESC;
 ```
 
-**对 R+/R 状态** — 查询谁抢占了它:
+**解读**:
+- **小核 (cpu 0-3)** 跑 Running 密集任务 → 说明调度器没有把线程迁移到大核，性能受限
+- **频率低**（如 1.0GHz 以下）→ 说明在 Running 期间 CPU 降频，算力不足，同等 Running 时间实际完成的工作量更少
+- **正常情况**：前台启动应用主线程应运行在大核（cpu 6-9 或 cpu 4-7）+ 高频（≥2.0GHz）
+- 频率信息来自 `cpufreq` counter（需要 trace 采集了该数据，否则查询无结果）
+
+关注：`mm_vmscan_direct_reclaim`（内存回收）、`loadLibrary`（加载 SO）、`OpenDexFilesFromOat`（DEX 加载）、高频小 slice（CPU 密集计算），以及上述在低频/小核上执行的情况。
+
+### Step 3B: 针对 R + R+ 时间长（>10ms）→ 查询抢占者（调度优先级分析）
 
 ```sql
 SELECT p2.name AS preemptor_process, t2.name AS preemptor_thread,
@@ -799,23 +789,71 @@ FROM sched_slice sc
 JOIN sched_slice sc2 ON sc2.cpu = sc.cpu AND sc2.ts = sc.ts + sc.dur
 JOIN thread t2 ON t2.utid = sc2.utid
 LEFT JOIN process p2 ON p2.upid = t2.upid
-WHERE sc.utid = <BLOCKER_UTID> AND sc.end_state = 'R+'
+WHERE sc.utid = <TARGET_UTID> AND sc.end_state = 'R+'
   AND sc.ts >= <START_TS> AND sc.ts + sc.dur <= <END_TS>
 GROUP BY p2.name, t2.name, sc2.priority
 ORDER BY preemptor_total_ms DESC LIMIT 15;
 ```
 
-### Step 5: 递归
+关注：抢占者优先级是否 <= 当前线程优先级（异常抢占）；同进程工作线程大量抢占（自身线程过多）。
 
-如果发现新的阻塞者（唤醒者线程阻塞时间 >20ms），以该线程为新目标，重复 Step 2-4。
+### Step 3C: 针对 Sleep (S) 时间长（>20ms）→ 追踪唤醒者（阻塞依赖分析）
 
-**递归终止条件**:
-- 达到最大深度（5 层）
-- 阻塞者主要是 Running 状态（>70%，已找到 CPU 根因）
-- 阻塞者主要是 D-IO（已找到 I/O 根因）
-- 新的阻塞时间 <20ms（不值得继续追踪）
+通过 sched_waking 追踪谁唤醒了目标线程。使用**纯 CTE 单语句查询**（`-q /dev/stdin` 的 heredoc 模式不支持多条返回结果的语句，`CREATE PERFETTO TABLE` 会导致 "Result rows were returned for multiples queries" 错误）:
 
-**执行方式**: 每个 Step 都是独立的 `trace_processor_shell` 调用（heredoc 模式）。对同一层的多个查询可以并行执行。使用 CREATE PERFETTO TABLE 时需要合并到同一个 SQL 文件（类似查询 16 的处理方式）。
+```sql
+WITH blocked AS (
+  SELECT ts.ts AS block_start, ts.ts + ts.dur AS wake_ts, ts.dur / 1e6 AS blocked_ms,
+         ts.state, ts.io_wait, ts.blocked_function
+  FROM thread_state ts
+  WHERE ts.utid = <TARGET_UTID>
+    AND ts.ts >= <START_TS> AND ts.ts + ts.dur <= <END_TS>
+    AND ts.state = 'S' AND ts.dur > 100000
+),
+waking AS (
+  SELECT fe.ts AS wake_event_ts, fe.utid AS waker_utid
+  FROM ftrace_event fe
+  JOIN args a ON a.arg_set_id = fe.arg_set_id AND a.key = 'pid'
+  WHERE fe.name = 'sched_waking'
+    AND a.int_value = <TARGET_TID>
+    AND fe.ts >= <START_TS> AND fe.ts <= <END_TS>
+),
+matched AS (
+  SELECT * FROM (
+    SELECT mb.block_start, mb.wake_ts, mb.blocked_ms,
+           mb.state, mb.io_wait, mb.blocked_function,
+           we.waker_utid, we.wake_event_ts,
+           ROW_NUMBER() OVER (PARTITION BY mb.block_start ORDER BY we.wake_event_ts DESC) AS rn
+    FROM blocked mb
+    LEFT JOIN waking we
+      ON we.wake_event_ts <= mb.wake_ts AND we.wake_event_ts > mb.wake_ts - 1000000
+  ) WHERE rn = 1 OR waker_utid IS NULL
+)
+SELECT m.blocked_ms, m.state, m.blocked_function,
+  t.name AS waker_thread, p.name AS waker_process,
+  (SELECT sc.priority FROM sched_slice sc WHERE sc.utid = m.waker_utid
+     AND sc.ts <= m.wake_event_ts AND sc.ts + sc.dur > m.wake_event_ts LIMIT 1) AS waker_priority
+FROM matched m
+LEFT JOIN thread t ON t.utid = m.waker_utid
+LEFT JOIN process p ON p.upid = t.upid
+WHERE m.rn = 1 OR m.waker_utid IS NULL
+ORDER BY m.blocked_ms DESC LIMIT 20;
+```
+
+**对 D non-IO 状态**：直接从 `blocked_function` 判断内核等待原因（`vm_mmap_pgoff`=mmap 映射、`mutex_lock`=内核 mutex 等），标注后即为终端，无需继续追踪。**对 D-IO 状态**：直接终端，标注 `blocked_function`（如 `folio_wait_bit_common`=等页面读入）。
+
+### Step 4: 递归
+
+以 Step 3C 中发现的**最大唤醒者**为新目标，对其重复 Step 2 → Step 3A/3B/3C，直到所有显著耗时都有终端根因。
+
+**递归终止条件**（满足任一即停止）:
+- Running >70%（已找到 CPU 根因）
+- D-IO 为主（已找到磁盘 I/O 根因）
+- D non-IO 已通过 blocked_function 定位（内核操作根因）
+- 剩余时间 <10ms（不值得继续追踪）
+- 已达 5 层深度
+
+**执行方式**: 每个 Step 都是独立的 `trace_processor_shell -q /dev/stdin` 调用（heredoc 模式），每次调用只能包含**一条** SQL 语句（多条语句会因多个 result set 报错）。同一层内的 Step 3A/3B/3C 可并行发起多个 Bash 调用以节省时间。Step 3C 已改为纯 CTE 单语句查询，无需 CREATE PERFETTO TABLE。
 
 ## 第四步：分析并生成报告
 
@@ -860,19 +898,7 @@ ORDER BY preemptor_total_ms DESC LIMIT 15;
 
 本节对全部发现进行综合归因，给出完整的根因链路。这是报告中最重要的部分，需要将分散的数据点串联成因果链。
 
-##### 5.1 核心结论
-
-先用 1-2 句话概括启动表现和根本原因，再用一段话（2-3 句）完整概括启动慢的全貌。格式:
-
-> **[包名] [启动类型]耗时 XXXms，属于[评定]级别（阈值 XXXms）。根因是……**
-
-然后用 2-3 句话展开，涵盖:
-- 最耗时的阶段是什么
-- 应用在做什么导致了慢
-- 是否有系统环境因素叠加
-- 各因素之间的关联关系
-
-##### 5.2 根因链路图
+##### 5.1 根因链路图
 
 用缩进文本树展示因果关系链，从系统级原因到应用级原因，层层展开。格式示例:
 
@@ -898,31 +924,89 @@ ORDER BY preemptor_total_ms DESC LIMIT 15;
 - 涵盖所有查询发现的主要问题，不遗漏
 - 区分**应用自身可控**的原因和**系统环境**原因
 - **层级关系必须基于 trace 中 slice 的实际父子关系（depth/parent_id），不能凭语义猜测**。例如 `makeApplication` 和 `app.onCreate` 在 trace 中都是 `bindApplication` 的直接子 slice，它们之间是并列关系而非包含关系，在链路图中应作为同级分支展示
-- **对阻塞者线程必须执行递归依赖链追踪（最多 5 层）**。当根因链路图中某个节点涉及主线程被其他线程阻塞（锁竞争 >10ms、Sleep 唤醒依赖 >20ms），必须:
-  1. 查询阻塞者线程在该时间窗口内的**线程状态分布**（Running/Sleep/D-IO/R/R+）和 **slice 执行内容**
-  2. 如果阻塞者自身有显著非 Running 时间（Sleep/D >30% 或 R/R+ >20%），继续追踪其唤醒者/阻塞者
-  3. 逐层递归，直到找到终端根因（Running >70% 即 CPU 工作、D-IO 即磁盘操作、或剩余阻塞 <10ms）
-  4. 每层标注: 线程名、优先级、时间窗口内状态占比、执行内容（slice 名）
-  5. 对 R+/R 状态，列出主要抢占者线程（名称、优先级、抢占总时间）
-  6. 在根因链路图中就地展开，作为该阻塞节点的子树，格式示例:
-     ```
-     ├─→ 101.8ms Sleep（唤醒者: log-manager, CFS 120）
-     │   └─→ log-manager 状态 [S 95.4ms | R+ 4.3ms | Running 1.1ms | R 1.1ms]
-     │       └─→ 92.1ms Sleep → 唤醒者: Thread-5 (CFS 120)
-     │           └─→ Thread-5 状态 [Running 45.1ms | D-IO 17.7ms | R+ 17.4ms | R 10.0ms]
-     │               ├─→ Running: loadLibrary → 22次 direct reclaim (30.2ms)
-     │               ├─→ D-IO 17.7ms: folio_wait_bit_common (SO 文件页面读取)
-     │               └─→ R+ 17.4ms: 被 RenderThread(RT 98) 6.6ms, surfaceflinger(RT 97) 3.2ms 等抢占
-     ```
-- **调度优先级分析（查询 14、15、16）的结果必须融入根因链路图的对应顶层原因中**，不作为独立章节。具体融入方式:
-  - **RT boost 缺失**（查询 14a/14b/14c/15）：如果主线程未获得 RT 优先级或存在大量异常抢占，作为一个独立的顶层原因（如"调度优先级异常"），展开优先级分布、跨应用对比、异常抢占者列表、影响量化。如果 RT 优先级正常，在根因链路图开头用一行说明"主线程调度优先级正常（RT 98 为主，XXms / XX%）"
-  - **依赖链优先级反转**（查询 16a-16d）：如果 CFS 唤醒占比 >30%，作为一个独立的顶层原因（如"依赖链优先级反转"），展开唤醒者分类汇总、各 CFS 唤醒者的线程状态和放大效应量化、反转全景图。如果 CFS 唤醒占比 <10%，可省略或一行说明"依赖链优先级正常"
-- **Binder 深度分析、锁竞争、GC 的结果必须融入根因链路图的对应分支中**，不作为独立章节。具体融入方式:
-  - **Binder 事务**（查询 7/11/12/13）：当某个 slice 的子节点是 `binder transaction` 时，在该分支内展开调用链（祖先来源）、AIDL 接口名、服务端 slice 树、服务端线程状态，作为该分支的递归深入内容
-  - **锁竞争**（查询 5、递归依赖链追踪）：当某个 slice 的子节点是 `monitor contention` / `Lock contention` 时，在该分支内展开锁持有者线程名、持有者线程状态分布、持有者正在执行的操作，作为该分支的递归深入内容
-  - **GC 活动**（查询 6）：如有 GC 事件，放入其所在的 slice 分支中（如 GC 导致某个阶段耗时增加，就在该阶段下展开）
+- **对每个节点的线程状态，必须按以下三类分别递归分析（最多 5 层），直到所有耗时都找到可直接定位的终端根因**:
 
-##### 5.3 核心问题清单
+  **① Running 时间长（单个节点 Running >20ms）→ 频率/内容分析 + CPU 核心与频点分析**
+  - 查询该时间窗口内的 slice 执行内容（`slice` 表按 dur 排序），找出耗时最长的操作（Step 3A-1）
+  - 查询运行在哪些 CPU 核心上、各核的 cpufreq 频点（Step 3A-2），关注：
+    - **跑在小核**（cpu 0-3）：调度器未迁移到大核，算力受限，同等 Running 耗时但实际吞吐更低
+    - **频率低**（如 <1.5GHz）：CPU 降频，应重点关注是否因其他负载导致功耗/热限制
+    - **频率波动大**：多次 Running 分布在不同频点，说明执行期间频率不稳定
+  - 关注：`mm_vmscan_direct_reclaim`（内存回收）、`loadLibrary`（加载 SO）、`OpenDexFilesFromOat`（DEX 加载）、高频小 slice（CPU 密集计算）
+  - 终端根因：已定位到具体函数/SDK 调用（含核心/频点信息），或 Running 占比 >70%（纯 CPU 工作）
+
+  **② Runnable 时间长（R + R+ >10ms）→ 调度优先级分析**
+  - 查询该线程被抢占时（`end_state='R+'`）接替者的进程、线程名、优先级、累计时间
+  - 关注：接替者优先级 <= 当前线程优先级时属于**异常抢占**；若接替者来自同一进程的其他工作线程，说明自身线程太多
+  - 若主线程 R/R+ 长：查询 14c 中的 ANOMALOUS 抢占列表；若依赖链上某线程 R/R+ 长：就地展开其抢占者列表
+  - 终端根因：已定位到具体抢占者（进程名/线程名/优先级），或 R+R 占比 <5ms 不值得继续展开
+
+  **③ Sleep (S) 或不可中断 D 时间长（>20ms）→ 阻塞依赖分析（递归主链）**
+  - **Sleep (S)**：通过 `sched_waking` 追踪唤醒者线程（查询 16 的模式）。以唤醒者为下一层目标，在唤醒者的时间窗口内继续做①②③分析
+  - **D-IO**：终端根因，标注 `blocked_function`（如 `folio_wait_bit_common`=等页面读入，`f2fs_down_read`=文件系统锁）
+  - **D non-IO**：通过 `blocked_function` 判断（如 `vm_mmap_pgoff`=mmap 内核操作，`mutex_lock`=内核 mutex），若仍不明确则追踪同时期持有该资源的线程
+  - 锁竞争 slice（`monitor contention`/`Lock contention`）：从 `owner tid` 定位持锁线程，以该线程为下一层目标
+  - Binder 事务：以服务端 slice（通过 flow 表关联）为下一层目标，展开服务端 slice 树和线程状态
+
+  **递归规则**:
+  - 每层必须先列出被分析线程的**完整状态分布**（Running Xms / S Xms / D-IO Xms / D Xms / R Xms / R+ Xms），再按各状态分别展开
+  - 满足以下**任一**条件时停止递归（终端节点）：① Running >70%（CPU 工作）② D-IO 为主（磁盘 I/O）③ 剩余时间 <10ms ④ 已达 5 层深度
+  - 每层标注：线程名、调度优先级（RT/CFS）、时间窗口、各状态耗时
+  - 同一层的多个分支（如多个 Sleep 段的不同唤醒者）可并列展开，用 `├─→` 区分
+
+  **格式示例**（3 层递归，覆盖三类状态）:
+  ```
+  ├─→ 未覆盖 135ms: Running 5ms, Sleep 130ms
+  │   └─→ Sleep 130ms → 唤醒者: keva-1 (CFS 120) [阻塞依赖分析 ③]
+  │       └─→ keva-1 状态 [Running 4ms | S 80ms | D 27ms | D-IO 4ms | R 34ms | R+ 6ms]
+  │           ├─→ Running 4ms: mm_vmscan_direct_reclaim (11ms+3ms) [频率分析 ①→终端]
+  │           │   CPU: cpu4 (大核) 3.1ms @ 1.2GHz, cpu5 0.9ms @ 1.4GHz  ← 大核但低频
+  │           ├─→ D 27ms: vm_mmap_pgoff (mmap Keva 文件) [D non-IO → 终端]
+  │           ├─→ D-IO 4ms: folio_wait_bit_common (等页面读入) [终端]
+  │           ├─→ S 80ms → 等待文件映射/mmap 完成后唤醒 [阻塞依赞分析 ③]
+  │           │   └─→ (文件映射完成由内核 kworker 唤醒，终端)
+  │           └─→ R 34ms: 等 CPU (CFS 120 竞争力低) [调度优先级分析 ②]
+  │               └─→ 主要抢占者: SystemUI RenderThread (CFS 110, 37.7ms), ChromiumNet0 (CFS 120, 25.8ms)
+  ```
+
+- **调度优先级分析（查询 14、15、16）的结果必须融入根因链路图的对应节点中**，不作为独立章节:
+  - **RT boost 缺失**（查询 14a/14b/14c/15）：主线程 R/R+ 长时，在对应未覆盖节点下用②类分析展开；如果 RT 优先级完全缺失，在链路图开头单独列一行"主线程 RT boost 缺失（全程 CFS XXX，正常应为 RT 98）"
+  - **RT 优先级正常**：在链路图开头用一行说明"主线程调度优先级正常（RT 98 为主，XXms / XX%）"
+  - **依赖链 CFS 唤醒 >30%**：在链路图中对应的 Sleep 节点下，用③类分析就地递归展开各 CFS 唤醒者；汇总全部 CFS 唤醒者的放大效应（实际 Running vs 等 CPU 时间）
+- **Binder、锁竞争、GC 的结果必须融入根因链路图对应分支中**，不作为独立章节:
+  - **Binder 事务**（查询 7/11/12/13）：`binder transaction` 节点用③类分析展开服务端 slice 树和线程状态
+  - **锁竞争**（查询 5）：`monitor contention`/`Lock contention` 节点用③类分析展开持锁线程状态和执行内容
+  - **GC 活动**（查询 6）：GC 事件放入其所在 slice 分支下展开
+
+##### 5.2 核心结论与问题清单
+
+###### 5.2.1 核心结论
+
+先用一句话概括启动表现，再用**根因时间分解**量化各类根因的贡献。格式:
+
+> **[包名] [启动类型]耗时 XXXms，属于[评定]级别（阈值 XXXms）。**
+
+然后按以下结构给出**根因时间分解**（基于主线程全局状态和递归分析结果）:
+
+| 根因类别 | 耗时 (ms) | 占比 | 说明 |
+|----------|-----------|------|------|
+| CPU Running（正常执行） | XXX | XX% | 应用代码执行 + 布局计算等 |
+| I/O 加载（D-IO） | XXX | XX% | 磁盘读取（DEX/SO/APK 文件、资源文件等） |
+| 阻塞等待（Sleep） | XXX | XX% | 等待后台线程/异步操作完成。其中 CFS 依赖 XXms（XX%，优先级反转放大）、RT 依赖 XXms（XX%，正常） |
+| 调度等待（R/R+） | XXX | XX% | 等待 CPU 分配，含被抢占时间 |
+| 内核操作（D non-IO） | XXX | XX% | mmap、mprotect 等内核操作 |
+
+最后用 2-3 句话展开因果关系，涵盖:
+- 最耗时的阶段是什么
+- 应用在做什么导致了慢
+- 系统环境因素（内存压力、优先级反转）如何放大了问题
+
+**说明**: 上述时间分解的数据来源:
+- CPU Running / D-IO / D non-IO / R / R+：直接来自查询 4（主线程状态分布）
+- CFS 依赖 vs RT 依赖：来自查询 16a（唤醒者优先级分类汇总），将 Sleep 总时间按 CFS/RT 唤醒占比拆分
+- 各项之和应约等于启动总耗时
+
+###### 5.2.2 核心问题清单
 
 用表格列出 3-6 个核心问题，每个问题包含直接影响和根因:
 
