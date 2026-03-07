@@ -697,9 +697,9 @@ SQL
 
 ## 第三步半D-0：顶层 Slice 线程状态分解（必须执行）
 
-**始终执行**: 对查询 1 中选定的 startup 的每个主线程顶层 slice（depth=0，dur >1ms），查询其时间窗口内主线程的线程状态分布。此数据用于：
+**始终执行**: 对查询 1 中选定的 startup 的每个主线程顶层 slice（depth=0，dur >1ms），查询其时间窗口内主线程的**完整线程状态分布**（Running/Sleep/D-IO/D non-IO/R/R+）。此数据用于：
 1. 根因链路图中每个顶层原因的精确状态标注（不得估算）
-2. 5.2.1 核心结论中 CPU Running 按阶段拆分表
+2. 5.2.1 核心结论中"按阶段拆分"表（所有状态列均来自此查询结果）
 
 ```sql
 -- 对每个顶层 slice 执行（替换 <SLICE_TS> 和 <SLICE_END_TS>）
@@ -1007,22 +1007,24 @@ ORDER BY m.blocked_ms DESC LIMIT 20;
 
 然后按以下结构给出**根因时间分解**（基于主线程全局状态和递归分析结果）:
 
+**全局根因时间分解**（来自查询 4，主线程全局状态汇总）:
+
 | 根因类别 | 耗时 (ms) | 占比 | 说明 |
 |----------|-----------|------|------|
-| CPU Running（正常执行） | XXX | XX% | 按阶段拆分见下表 |
+| CPU Running（正常执行） | XXX | XX% | 应用代码执行 + 布局计算等 |
 | I/O 加载（D-IO） | XXX | XX% | 磁盘读取（DEX/SO/APK 文件、资源文件等） |
 | 阻塞等待（Sleep） | XXX | XX% | 等待后台线程/异步操作完成。其中 CFS 依赖 XXms（XX%，优先级反转放大）、RT 依赖 XXms（XX%，正常） |
 | 调度等待（R/R+） | XXX | XX% | 等待 CPU 分配，含被抢占时间 |
 | 内核操作（D non-IO） | XXX | XX% | mmap、mprotect 等内核操作 |
 
-**CPU Running 按阶段拆分**（必须通过查询每个顶层 slice 时间窗口内主线程 `thread_state` 获取精确值，不得估算）:
+**按阶段拆分**（来自第三步半D-0 查询，每个顶层 slice 的精确线程状态。所有数值必须来自查询结果，不得估算）:
 
-| 阶段 | Running (ms) | 主要内容 |
-|------|------------|---------|
-| bindApplication | XXX | SDK 初始化、DEX 加载等 |
-| doFrame (各帧) | XXX | 布局 measure/layout 计算 |
-| clientTransactionExecuted | XXX | Activity 生命周期回调 |
-| 其他 | XXX | ActivityThreadMain、帧间间隙等 |
+| 阶段 | 总耗时 (ms) | Running | Sleep | D-IO | R/R+ | D non-IO |
+|------|-----------|---------|-------|------|------|----------|
+| bindApplication | XXX | XXX | XXX | XXX | XXX | XXX |
+| doFrame (各帧) | XXX | XXX | XXX | XXX | XXX | XXX |
+| clientTransactionExecuted | XXX | XXX | XXX | XXX | XXX | XXX |
+| 其他 | XXX | XXX | XXX | XXX | XXX | XXX |
 
 最后用 2-3 句话展开因果关系，涵盖:
 - 最耗时的阶段是什么
@@ -1030,10 +1032,10 @@ ORDER BY m.blocked_ms DESC LIMIT 20;
 - 系统环境因素（内存压力、优先级反转）如何放大了问题
 
 **说明**: 上述时间分解的数据来源:
-- CPU Running / D-IO / D non-IO / R / R+：直接来自查询 4（主线程状态分布）
-- CPU Running 按阶段拆分：对每个顶层 slice（depth=0）查询其时间窗口内主线程 `thread_state` 中 `state='Running'` 的总时间。查询方式见下方
+- 全局根因时间分解：直接来自查询 4（主线程状态分布）
+- 按阶段拆分：来自第三步半D-0（对每个顶层 slice 查询 `thread_state`），每列值均为该 slice 时间窗口内主线程对应状态的精确耗时
 - CFS 依赖 vs RT 依赖：来自查询 16a（唤醒者优先级分类汇总），将 Sleep 总时间按 CFS/RT 唤醒占比拆分
-- 各项之和应约等于启动总耗时
+- 按阶段拆分表各行之和应约等于全局根因时间分解表中对应列的值
 
 ###### 5.2.2 核心问题清单
 
